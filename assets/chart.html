@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0B0B0C; font-family: 'Segoe UI', sans-serif; overflow: hidden; }
+  #header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 14px; background: #151517;
+    border-bottom: 1px solid #222228;
+  }
+  #symbol { color: #F3BA2F; font-size: 15px; font-weight: 700; }
+  #price  { color: #F5F5F5; font-size: 22px; font-weight: 700; }
+  #change { font-size: 13px; font-weight: 600; }
+  #tf-btns { margin-left: auto; display: flex; gap: 6px; }
+  .tf-btn {
+    background: #1B1B1F; border: 1px solid #222228; color: #A9A9AD;
+    padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px;
+    transition: all .15s;
+  }
+  .tf-btn.active, .tf-btn:hover { background: #F3BA2F22; border-color: #F3BA2F; color: #F3BA2F; }
+  #chart  { width: 100%; height: calc(100vh - 40px); }
+</style>
+</head>
+<body>
+<div id="header">
+  <span id="symbol">-</span>
+  <span id="price">-</span>
+  <span id="change">-</span>
+  <div id="tf-btns">
+    <button class="tf-btn active" onclick="setTf('1m')">1m</button>
+    <button class="tf-btn" onclick="setTf('3m')">3m</button>
+    <button class="tf-btn" onclick="setTf('5m')">5m</button>
+    <button class="tf-btn" onclick="setTf('15m')">15m</button>
+  </div>
+</div>
+<div id="chart"></div>
+
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+  layout: {
+    background: { color: '#0B0B0C' },
+    textColor: '#A9A9AD',
+    fontSize: 12,
+  },
+  grid: {
+    vertLines: { color: '#1a1a1e' },
+    horzLines: { color: '#1a1a1e' },
+  },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  rightPriceScale: { borderColor: '#222228' },
+  timeScale: {
+    borderColor: '#222228',
+    timeVisible: true,
+    secondsVisible: false,
+  },
+  handleScroll: true,
+  handleScale: true,
+});
+
+const candleSeries = chart.addCandlestickSeries({
+  upColor:       '#0ECB81',
+  downColor:     '#F6465D',
+  borderUpColor: '#0ECB81',
+  borderDownColor:'#F6465D',
+  wickUpColor:   '#0ECB81',
+  wickDownColor: '#F6465D',
+});
+
+const volumeSeries = chart.addHistogramSeries({
+  color: '#26a69a',
+  priceFormat: { type: 'volume' },
+  priceScaleId: 'vol',
+  scaleMargins: { top: 0.8, bottom: 0 },
+});
+
+chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
+
+let currentTf = '1m';
+let slLines = [];
+let tpLines = [];
+
+function setTf(tf) {
+  currentTf = tf;
+  document.querySelectorAll('.tf-btn').forEach(b => {
+    b.classList.toggle('active', b.textContent === tf);
+  });
+  if (window.lastData && window.lastData[tf]) {
+    renderData(window.lastData[tf]);
+  }
+}
+
+function renderData(data) {
+  if (!data || !data.candles || data.candles.length === 0) return;
+
+  candleSeries.setData(data.candles);
+  if (data.volumes) volumeSeries.setData(data.volumes);
+
+  // SL/TP çizgileri
+  slLines.forEach(l => candleSeries.removePriceLine(l));
+  tpLines.forEach(l => candleSeries.removePriceLine(l));
+  slLines = []; tpLines = [];
+
+  (data.positions || []).forEach(pos => {
+    slLines.push(candleSeries.createPriceLine({
+      price: pos.sl, color: '#F6465D', lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true, title: `SL ${pos.side.toUpperCase()}`,
+    }));
+    tpLines.push(candleSeries.createPriceLine({
+      price: pos.tp, color: '#0ECB81', lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dashed,
+      axisLabelVisible: true, title: `TP ${pos.side.toUpperCase()}`,
+    }));
+  });
+
+  // Header güncelle
+  const last = data.candles[data.candles.length - 1];
+  const first = data.candles[0];
+  const pct = ((last.close - first.open) / first.open * 100).toFixed(2);
+  document.getElementById('symbol').textContent = data.symbol || '-';
+  document.getElementById('price').textContent  = last.close.toFixed(4);
+  const chgEl = document.getElementById('change');
+  chgEl.textContent = (pct >= 0 ? '+' : '') + pct + '%';
+  chgEl.style.color = pct >= 0 ? '#0ECB81' : '#F6465D';
+
+  chart.timeScale().fitContent();
+}
+
+// Python'dan gelen veriyi al (window.updateChart fonksiyonu çağrılır)
+window.updateChart = function(jsonStr) {
+  try {
+    const data = JSON.parse(jsonStr);
+    window.lastData = window.lastData || {};
+    if (data.tf) window.lastData[data.tf] = data;
+    if (data.tf === currentTf) renderData(data);
+  } catch(e) { console.error('Chart update error:', e); }
+};
+
+// Resize
+new ResizeObserver(() => {
+  chart.applyOptions({
+    width:  document.getElementById('chart').clientWidth,
+    height: document.getElementById('chart').clientHeight,
+  });
+}).observe(document.getElementById('chart'));
+</script>
+</body>
+</html>

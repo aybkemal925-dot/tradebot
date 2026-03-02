@@ -1,0 +1,61 @@
+﻿{
+    "app":  {
+                "name":  "Austrade",
+                "paper_mode":  true,
+                "starting_balance_usd":  100.0,
+                "refresh_seconds":  10,
+                "debug":  false
+            },
+    "exchange":  {
+                     "name":  "binance",
+                     "symbol":  "BTC/USDT",
+                     "timeframe":  "15m",
+                     "limit":  500,
+                     "api_key":  "",
+                     "api_secret":  "",
+                     "market_type":  "futures",
+                     "leverage":  5,
+                     "symbols":  [
+
+                                 ],
+                     "majors_only":  true,
+                     "symbol_count":  20,
+                     "scan_quote":  "USDT"
+                 },
+    "risk":  {
+                 "risk_per_trade_pct":  10.0,
+                 "max_open_positions":  5,
+                 "max_daily_loss_pct":  10.0,
+                 "fee_pct":  0.1,
+                 "target_rr":  2.0,
+                 "atr_period":  14,
+                 "atr_stop_mult":  1.5,
+                 "leverage":  5
+             },
+    "strategy":  {
+                     "pivot_lookback":  5,
+                     "swing_lookback":  50,
+                     "confirm_bars":  1,
+                     "use_choch_only":  false,
+                     "use_ob_fvg_filter":  false,
+                     "htf_timeframe":  "30m",
+                     "rsi_long_max":  35.0,
+                     "rsi_short_min":  65.0,
+                     "adx_period":  14,
+                     "adx_threshold":  18.0,
+                     "cvd_lookback":  30,
+                     "score_threshold":  75.0,
+                     "technical_weight":  0.40,
+                     "onchain_weight":  0.25,
+                     "sentiment_weight":  0.10,
+                     "regime_weight":  0.25
+                 },
+    "storage":  {
+                    "db_path":  "austrade.db"
+                },
+    "telegram":  {
+                     "enabled":  false,
+                     "token":  "",
+                     "chat_id":  ""
+                 }
+}

@@ -1,0 +1,132 @@
+================================================================
+  AUSTRADE - YAPILACAKLAR LİSTESİ
+  Son güncelleme: 2026-02-28
+================================================================
+
+================================================================
+  ✅ TAMAMLANANLAR (2026-02-28)
+================================================================
+
+1. ✅ SL/TP'yi exchange'e order olarak gönder
+   - exchange.py: place_sl_tp_orders() eklendi
+     (stop_market + take_profit_market, reduceOnly=True, closePosition=True)
+   - engine.py: open_position sonrası place_sl_tp_orders() çağrılıyor (live mode)
+   - Pozisyon kapatılırken cancel_all_orders() ile önceki order'lar iptal ediliyor
+
+2. ✅ Başlangıçta exchange'den açık pozisyonları çek (sync)
+   - storage.py: open_positions tablosu + save/load/delete CRUD eklendi
+   - engine.py: _sync_positions() → DB'den yükle, live'da exchange ile karşılaştır
+   - Restart'ta pozisyon ve trail_distance map'i geri yükleniyor
+
+3. ✅ Günlük maksimum zarar limiti
+   - config.json: "max_daily_loss_pct": 10.0 eklendi
+   - config.py: RiskConfig.max_daily_loss_pct alanı eklendi
+   - engine.py: _check_daily_loss_limit() loop başında kontrol ediyor
+   - Limit aşılınca yeni pozisyon açılmıyor, UI'da "GÜNLÜK LİMİT" badge gösteriliyor
+   - Telegram'a bildirim gönderiliyor
+
+4. ✅ Paper modda test (backtest değil)
+   - Paper mode aktif, pozisyonlar DB'ye kaydediliyor
+   - Restart sonrası pozisyonlar geri yükleniyor
+
+5. ✅ Telegram bildirimi
+   - austrade/telegram_notifier.py oluşturuldu (stdlib urllib — dış bağımlılık yok)
+   - Bildirim: pozisyon açılınca, kapanınca, günlük limit aşılınca
+   - send_daily_summary() metodu hazır (engine.py'e eklenebilir)
+   - Etkinleştirme: config.json "telegram" > "enabled": true, token, chat_id doldur
+   - Veya .env dosyasında TELEGRAM_TOKEN ve TELEGRAM_CHAT_ID
+
+6. ✅ Watchdog / otomatik yeniden başlatma
+   - watchdog.py oluşturuldu
+   - 60 sn'de bir PID kontrolü, çökmüşse restart
+   - Task Scheduler'a eklenebilir (pc açılışında arka planda çalışır)
+
+7. ✅ Minimum order size kontrolü
+   - exchange.py: min_order_amount() eklendi
+   - engine.py: _maybe_open_position() içinde min amount kontrolü
+   - Min altındaysa pozisyon açılmıyor, log'a yazılıyor
+
+8. ✅ API key güvenliği
+   - .env dosyası oluşturuldu (API key'ler buraya taşındı)
+   - .env.example oluşturuldu (şablon)
+   - config.json'daki api_key ve api_secret alanları boşaltıldı
+   - config.py: _load_dotenv() ile .env okuma (python-dotenv bağımlılığı yok)
+   - Öncelik sırası: .env > config.json
+
+9. ✅ swing_lookback stratejide kullanılsın
+   - config.py: StrategyConfig.swing_lookback alanı eklendi
+   - strategy_smc.py: swing_lb = cfg.swing_lookback (artık config'den okunuyor)
+   - config.json'da "swing_lookback": 50
+
+10. ✅ OB/FVG sinyal filtresinde kullanılsın
+    - strategy_smc.py: _build_raw_signal() içinde OB/FVG filtresi aktif edildi
+    - OB veya FVG yoksa eski davranış (premium/discount), varsa filtre uygulanıyor
+    - FVG'de Pine Script uyumlu c1 (orta bar close) onayı eklendi
+    - OB dedup: pivot index'i takip edilerek aynı pivot'tan 2 kez OB eklenmesi önlendi
+    - Sinyal notuna "OB" ve/veya "FVG" ekleniyor
+
+11. ✅ UI iyileştirmeleri
+    - Equity curve: ft.LineChart ile grafik eklendi (Grafik butonu ile göster/gizle)
+    - Geçmiş tablosunda toplam PNL satırı eklendi
+    - Stat kartına "Toplam PNL" eklendi
+    - Status bar'a "GÜNLÜK LİMİT" badge eklendi (limit aşılınca kırmızı)
+
+12. ✅ Pozisyon persistence (veritabanına kaydet)
+    - storage.py: open_positions tablosu (INSERT OR REPLACE)
+    - save_position() / update_position_sl() / delete_position() / load_open_positions()
+    - Trailing stop güncellemelerinde DB de güncelleniyor
+    - Bot restart'ta pozisyonlar DB'den otomatik yükleniyor
+
+================================================================
+  📋 MEVCUT DURUM (2026-02-28)
+================================================================
+
+✅ Tamamlananlar:
+   - SMC strateji (BOS/CHoCH, OB, FVG, internal/swing structure)
+   - Risk yönetimi (ATR stop, %10 risk, margin cap, 5x kaldıraç)
+   - Paper trading modu
+   - Flet dark-theme UI (pozisyon tablosu + detay popup + equity curve)
+   - SQLite storage (trade geçmişi + balance snapshots + open_positions)
+   - 1m timeframe, confirm_bars=1 (bar kapanışında onay)
+   - 20 coin tarama (majors only)
+   - Trailing stop loss
+   - Merkezi loglama
+   - SL/TP exchange'e gönderiliyor (live modda)
+   - Restart'ta pozisyonlar DB'den yükleniyor
+   - Günlük zarar limiti
+   - Minimum order size kontrolü
+   - Telegram bildirimleri (etkinleştirme: config.json'da enabled:true)
+   - Watchdog otomatik restart scripti
+   - API key güvenliği (.env)
+   - swing_lookback doğru kullanılıyor
+   - OB/FVG sinyal filtresinde aktif
+
+⚠️  Kalan konular:
+   - Paper modda en az 1-2 hafta çalıştırarak sonuçları incele
+   - Win rate %50 altındaysa strateji parametrelerini düzelt
+   - MEXC tam test edilmedi
+   - Bybit desteği eklenebilir
+   - Telegram günlük 08:00 özeti için scheduler eklenmeli
+     (engine._loop içinde saat kontrolü yapılabilir)
+
+================================================================
+  🔧 KULLANIM KILAVUZU
+================================================================
+
+Normal başlatma:
+    python app.py
+
+Watchdog ile başlatma (çökünce auto-restart):
+    python watchdog.py
+
+Telegram aktivasyonu:
+    1. config.json > "telegram" > "enabled": true
+    2. .env dosyasına TELEGRAM_TOKEN ve TELEGRAM_CHAT_ID ekle
+       (BotFather'dan bot oluştur, /start ile chat_id öğren)
+
+API key kurulumu:
+    .env dosyasını düzenle:
+        AUSTRADE_API_KEY=...
+        AUSTRADE_API_SECRET=...
+
+================================================================
