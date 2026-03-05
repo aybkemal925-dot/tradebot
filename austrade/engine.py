@@ -46,7 +46,7 @@ class CircuitBreaker:
             return False
         if self.state == "open" and time.time() - self.open_at > self.recovery_sec:
             self.state = "half_open"
-            logger.info("Circuit breaker HALF-OPEN — trying recovery")
+            logger.info("Circuit breaker HALF-OPEN, trying recovery")
             return False
         return self.state == "open"
 
@@ -73,7 +73,6 @@ class EngineSnapshot:
     daily_loss_halted: bool = False
 
 
-# Korelasyonlu sembol kümeleri — aynı kümeden aynı anda 1 pozisyon
 _CORRELATED_CLUSTERS: list[set[str]] = [
     {"BTC/USDT", "ETH/USDT"},
     {"SOL/USDT", "AVAX/USDT", "NEAR/USDT"},
@@ -88,18 +87,16 @@ class TradeEngine:
         self.signal_scorer = SignalScorer(settings, self.exchange)
         self.storage = Storage(settings.storage.db_path)
 
-        # Telegram notifier (lazy import to avoid breaking without requests)
         try:
             from .telegram_notifier import TelegramNotifier
+
             self.telegram: TelegramNotifier | None = TelegramNotifier(settings.telegram)
         except Exception:  # noqa: BLE001
             self.telegram = None
 
         self.symbols = self._initial_symbols()
-
-        # Strateji seçimi: Triple Confirmation aktifse onu, değilse SMC kullan
-        logger.info("Strateji: LuxAlgo")
-        self.strategies: dict = {
+        logger.info("Strateji: LuxAlgo MCP proxy")
+        self.strategies: dict[str, LuxAlgoStrategy] = {
             symbol: LuxAlgoStrategy(settings.strategy)
             for symbol in self.symbols
         }
@@ -115,34 +112,28 @@ class TradeEngine:
         self.last_changes: dict[str, float] = {s: 0.0 for s in self.symbols}
         self.open_positions: list[Position] = []
         self.trail_distance: dict[int, float] = {}
+        self.cooldown_until_ts: dict[str, int] = {}
         self.last_signal = "-"
         self.last_error = ""
         self.max_retries = 3
         self.daily_loss_halted = False
         self.circuit_breaker = CircuitBreaker()
 
-        # Restart'ta pozisyonları DB'den yükle
         self._sync_positions()
-
-    # ─── Startup ─────────────────────────────────────────────────────────────
 
     def _initial_symbols(self) -> list[str]:
         if self.settings.exchange.symbols:
             return list(self.settings.exchange.symbols[: self.settings.exchange.symbol_count])
-
         try:
             universe = self.exchange.fetch_universe_symbols(self.settings.exchange.symbol_count)
             if universe:
                 return universe
         except Exception as exc:  # noqa: BLE001
             logger.warning("Universe selection failed, fallback symbol: %s", exc)
-
         return [self.settings.exchange.symbol]
 
     def _sync_positions(self) -> None:
-        """Bot yeniden başlatılınca açık pozisyonları yükle."""
         db_positions = self.storage.load_open_positions()
-
         if db_positions:
             self.open_positions = db_positions
             self.position_seq = max(p.id for p in db_positions) + 1
@@ -163,15 +154,14 @@ class TradeEngine:
                         still_open.append(pos)
                     else:
                         logger.warning(
-                            "Position %s %s not found on exchange — marking closed",
-                            pos.id, pos.symbol,
+                            "Position %s %s not found on exchange, marking closed",
+                            pos.id,
+                            pos.symbol,
                         )
                         self.storage.delete_position(pos.id)
                 self.open_positions = still_open
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Exchange position sync failed: %s", exc)
-
-    # ─── Engine control ───────────────────────────────────────────────────────
 
     def start(self) -> None:
         if self.running:
@@ -187,10 +177,7 @@ class TradeEngine:
             self.thread.join(timeout=2)
         logger.info("Engine stopped")
 
-    # ─── Main loop ────────────────────────────────────────────────────────────
-
     def _fetch_all_ohlcv(self, symbol_list: list[str], timeframe: str | None = None) -> dict[str, object]:
-        """Sembolleri paralel olarak fetch et (4x hız artışı)."""
         result: dict[str, object] = {}
         tf = timeframe or self.settings.exchange.timeframe
         with ThreadPoolExecutor(max_workers=min(4, len(symbol_list))) as ex:
@@ -202,8 +189,8 @@ class TradeEngine:
                 sym = futures[fut]
                 try:
                     result[sym] = fut.result(timeout=15)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("fetch_ohlcv timeout/error: %s — %s", sym, e)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("fetch_ohlcv timeout/error: %s - %s", sym, exc)
         return result
 
     def _loop(self) -> None:
@@ -211,11 +198,9 @@ class TradeEngine:
         while self.running:
             try:
                 if self.circuit_breaker.is_open():
-                    logger.warning("Circuit breaker open — skipping loop iteration")
                     time.sleep(self.settings.app.refresh_seconds)
                     continue
 
-                # Günlük zarar limiti ve drawdown kontrolü
                 with self.lock:
                     halted = self._check_daily_loss_limit() or self._check_drawdown_limit()
                 if halted:
@@ -224,8 +209,6 @@ class TradeEngine:
 
                 symbol_list = list(self.symbols)
                 market_snap = self.exchange.fetch_market_snapshot(symbol_list)
-
-                # Paralel OHLCV fetch
                 ohlcv_map = self._fetch_all_ohlcv(symbol_list, self.settings.exchange.timeframe)
                 htf_tf = self.settings.strategy.htf_timeframe
                 if self.settings.strategy.htf_trend_filter and htf_tf != self.settings.exchange.timeframe:
@@ -233,26 +216,16 @@ class TradeEngine:
                 else:
                     htf_map = ohlcv_map
                 btc_df = ohlcv_map.get("BTC/USDT")
-                if btc_df is None or btc_df.empty:
-                    try:
-                        btc_df = self.exchange.fetch_ohlcv_for_timeframe(
-                            "BTC/USDT",
-                            self.settings.exchange.timeframe,
-                            self.settings.exchange.limit,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("BTC regime fetch failed: %s", exc)
-                        btc_df = None
 
                 for symbol in symbol_list:
                     df = ohlcv_map.get(symbol)
                     if df is None or df.empty:
-                        logger.warning("Empty/missing OHLCV for %s — skipping", symbol)
                         continue
 
                     htf_df = htf_map.get(symbol)
                     signal = self.strategies[symbol].next_signal(df, htf_df=htf_df)
                     price = float(df["close"].iloc[-1])
+                    bar_ts = int(df["ts"].iloc[-1])
 
                     snap_info = market_snap.get(symbol, {})
                     last = float(snap_info.get("last", 0.0))
@@ -261,7 +234,7 @@ class TradeEngine:
                     with self.lock:
                         self.last_prices[symbol] = last if last > 0 else price
                         self.last_changes[symbol] = change
-                        self._update_open_positions_for_symbol(symbol, self.last_prices[symbol])
+                        self._update_open_positions_for_symbol(symbol, self.last_prices[symbol], bar_ts)
                         if signal:
                             scorecard = self.signal_scorer.score_signal(
                                 signal,
@@ -288,16 +261,19 @@ class TradeEngine:
                     self.last_error = ""
                 retry = 0
                 self.circuit_breaker.record_success()
-
             except ccxt.NetworkError as exc:
                 retry += 1
                 self.last_error = f"NetworkError: {exc}"
                 logger.warning("Network error (%s/%s): %s", retry, self.max_retries, exc)
+                if retry >= self.max_retries:
+                    self._notify(f"API hatasi: NetworkError: {exc}")
                 self.circuit_breaker.record_failure()
             except ccxt.ExchangeError as exc:
                 retry += 1
                 self.last_error = f"ExchangeError: {exc}"
                 logger.error("Exchange error (%s/%s): %s", retry, self.max_retries, exc)
+                if retry >= self.max_retries:
+                    self._notify(f"API hatasi: ExchangeError: {exc}")
                 self.circuit_breaker.record_failure()
             except (ValueError, KeyError, IndexError) as exc:
                 retry += 1
@@ -307,24 +283,20 @@ class TradeEngine:
                 retry += 1
                 self.last_error = str(exc)
                 logger.exception("Unexpected engine error: %s", exc)
+                if retry >= self.max_retries:
+                    self._notify(f"Kritik hata: {exc}")
                 self.circuit_breaker.record_failure()
 
             retry = min(retry, self.max_retries)
             backoff = min(2**retry, 20)
             sleep_for = self.settings.app.refresh_seconds if retry == 0 else backoff
-            logger.info("Engine loop sleep: %ss", sleep_for)
             time.sleep(sleep_for)
 
-    # ─── Daily loss + drawdown limits ─────────────────────────────────────────
-
     def _check_daily_loss_limit(self) -> bool:
-        """Günlük zarar limiti aşıldıysa True döndür. Lock içinde çağrılmalı."""
         max_loss_pct = self.settings.risk.max_daily_loss_pct
         if max_loss_pct <= 0:
             return False
-
         daily_pnl = self.storage.today_pnl()
-        # starting_balance sabiti — dinamik cash değil
         starting_balance = self.settings.app.starting_balance_usd
         if daily_pnl < 0:
             loss_pct = abs(daily_pnl) / max(1.0, starting_balance) * 100.0
@@ -332,19 +304,17 @@ class TradeEngine:
                 if not self.daily_loss_halted:
                     self.daily_loss_halted = True
                     msg = (
-                        f"Günlük zarar limiti aşıldı! "
+                        f"Gunluk zarar limiti asildi. "
                         f"PNL: ${daily_pnl:.2f} (-%{loss_pct:.1f}). "
-                        f"Bot yeni pozisyon açmıyor."
+                        f"Bot yeni pozisyon acmiyor."
                     )
                     logger.warning(msg)
                     self._notify(msg)
                 return True
-
         self.daily_loss_halted = False
         return False
 
     def _check_drawdown_limit(self) -> bool:
-        """Max drawdown kontrolü. Lock içinde çağrılmalı."""
         max_dd_pct = self.settings.risk.max_drawdown_pct
         if max_dd_pct <= 0:
             return False
@@ -352,66 +322,70 @@ class TradeEngine:
         if peak > 0 and self.equity > 0:
             dd_pct = (peak - self.equity) / peak * 100.0
             if dd_pct >= max_dd_pct:
-                logger.error(
-                    "Max drawdown reached: %.1f%% (peak=%.2f current=%.2f)",
-                    dd_pct, peak, self.equity,
-                )
                 self._notify(
-                    f"🔴 Max Drawdown Aşıldı!\n"
-                    f"Düşüş: %{dd_pct:.1f} (peak=${peak:.2f}, şu an=${self.equity:.2f})\n"
-                    f"Bot yeni pozisyon açmıyor."
+                    f"Max drawdown asildi. "
+                    f"Dusus: %{dd_pct:.1f} (peak=${peak:.2f}, equity=${self.equity:.2f})"
                 )
                 return True
         return False
 
     def _count_consecutive_losses(self) -> int:
-        """Son işlemlerden ardışık zarar sayısını döndür."""
         trades = self.storage.recent_trades(20)
         count = 0
-        for t in trades:
-            if t.get("pnl_usd", 0) < 0:
+        for trade in trades:
+            if trade.get("pnl_usd", 0) < 0:
                 count += 1
             else:
                 break
         return count
 
-    # ─── Position management ──────────────────────────────────────────────────
-
     def _is_correlated_with_open(self, symbol: str) -> bool:
-        """Aynı korelasyon kümesinden zaten açık pozisyon varsa True döndür."""
         for cluster in _CORRELATED_CLUSTERS:
             if symbol in cluster:
                 for pos in self.open_positions:
                     if pos.symbol in cluster and pos.symbol != symbol:
-                        logger.info(
-                            "Korelasyon filtresi: %s ile %s çakışıyor", symbol, pos.symbol
-                        )
                         return True
         return False
 
     def _check_portfolio_notional_cap(self, symbol: str, new_qty: float, new_price: float) -> bool:
-        """Toplam notional cap aşılıyorsa True döndür (pozisyon açma)."""
         portfolio = self.settings.portfolio
         if portfolio is None:
             return False
         max_notional_pct = portfolio.max_notional_pct
-        lev = self.settings.risk.leverage
         total_notional = sum(
-            p.qty * self.last_prices.get(p.symbol, p.entry_price) * lev
+            p.qty * self.last_prices.get(p.symbol, p.entry_price)
             for p in self.open_positions
         )
-        new_notional = new_qty * new_price * lev
+        new_notional = new_qty * new_price
         cap = self.equity * (max_notional_pct / 100.0)
-        if (total_notional + new_notional) > cap:
-            logger.info(
-                "Portfolio notional cap aşılıyor: mevcut=%.2f + yeni=%.2f > cap=%.2f — atlanıyor",
-                total_notional, new_notional, cap,
-            )
-            return True
-        return False
+        return (total_notional + new_notional) > cap
+
+    def _timeframe_minutes(self) -> float:
+        tf = str(self.settings.exchange.timeframe).strip().lower()
+        if tf.endswith("m"):
+            return float(tf[:-1])
+        if tf.endswith("h"):
+            return float(tf[:-1]) * 60.0
+        if tf.endswith("d"):
+            return float(tf[:-1]) * 1440.0
+        return 5.0
+
+    def _start_cooldown(self, symbol: str, bar_ts: int) -> None:
+        cooldown_bars = max(int(self.settings.strategy.cooldown_bars), 0)
+        if cooldown_bars <= 0:
+            return
+        self.cooldown_until_ts[symbol] = int(
+            bar_ts + (self._timeframe_minutes() * 60_000 * cooldown_bars)
+        )
+
+    def _cooldown_active(self, symbol: str, bar_ts: int) -> bool:
+        return int(bar_ts) < self.cooldown_until_ts.get(symbol, 0)
 
     def _maybe_open_position(self, symbol: str, signal, df, scorecard: ScoreCard | None = None) -> None:
+        bar_ts = int(df["ts"].iloc[-1])
         if self.daily_loss_halted:
+            return
+        if self._cooldown_active(symbol, bar_ts):
             return
         if len(self.open_positions) >= self.settings.risk.max_open_positions:
             return
@@ -420,45 +394,31 @@ class TradeEngine:
         if self._is_correlated_with_open(symbol):
             return
 
-        # Ardışık kayıp kontrolü
         max_consec = self.settings.risk.max_consecutive_losses
         if max_consec > 0 and self._count_consecutive_losses() >= max_consec:
-            logger.info(
-                "Ardışık kayıp limiti (%s) aşıldı — pozisyon atlanıyor", max_consec
-            )
             return
 
-        if scorecard is not None and not scorecard.passed:
+        if scorecard is not None:
             logger.info(
-                "Signal skipped by score gate: %s %s score=%.1f threshold=%.1f [%s]",
+                "Signal score: %s %s score=%.1f [%s]",
                 symbol,
                 signal.side,
                 scorecard.total,
-                scorecard.threshold,
                 scorecard.summary(),
             )
-            return
 
         sizing = self.risk.size_position(signal, self.equity, df, self.open_positions)
         if not sizing:
             return
-
-        # Toplam notional cap kontrolü
         if self._check_portfolio_notional_cap(symbol, sizing.qty, signal.price):
             return
 
-        # ── Triple Confirmation: SL/TP'yi override et (ATR*1.5 / ATR*4.5) ──
         qty = sizing.qty
         entry_price = signal.price
-
         if not self.settings.app.paper_mode:
             min_amt = self.exchange.min_order_amount(symbol)
             rounded_qty = float(self.exchange.amount_to_precision(symbol, qty))
             if rounded_qty <= 0 or (min_amt > 0 and rounded_qty < min_amt):
-                logger.warning(
-                    "Order size too small: %s qty=%.6f min=%.6f — skipping",
-                    symbol, rounded_qty, min_amt,
-                )
                 return
             qty = rounded_qty
             entry_price = self.exchange.open_position(symbol, signal.side, qty)
@@ -470,59 +430,133 @@ class TradeEngine:
             qty=qty,
             entry_price=entry_price,
             stop_loss=sizing.stop_loss,
-            take_profit=sizing.take_profit,
+            take_profit=sizing.tp1_price,
             opened_at=datetime.now(timezone.utc),
+            initial_qty=qty,
+            tp1_price=sizing.tp1_price,
+            tp1_hit=False,
+            break_even_price=entry_price,
+            trail_callback_pct=sizing.trail_callback_pct,
+            trail_activation_price=sizing.trail_activation_price,
+            trailing_active=False,
         )
         self.position_seq += 1
         self.open_positions.append(pos)
-        self.trail_distance[pos.id] = abs(entry_price - sizing.stop_loss)
-
+        self.trail_distance[pos.id] = sizing.stop_distance
         self.storage.save_position(pos)
+        self._start_cooldown(symbol, bar_ts)
 
-        if not self.settings.app.paper_mode:
-            self.exchange.place_sl_tp_orders(
-                symbol, signal.side, qty, sizing.stop_loss, sizing.take_profit
-            )
-
-        strategy_tag = "TRIPLE" if signal.kind == "triple" else signal.kind.upper()
+        strategy_tag = signal.kind.upper()
         logger.info(
-            "Position opened [%s]: id=%s symbol=%s side=%s qty=%.6f entry=%.4f sl=%.4f tp=%.4f",
-            strategy_tag, pos.id, pos.symbol, pos.side, pos.qty,
-            pos.entry_price, pos.stop_loss, pos.take_profit,
+            "Position opened [%s]: id=%s symbol=%s side=%s qty=%.6f entry=%.4f sl=%.4f tp1=%.4f",
+            strategy_tag,
+            pos.id,
+            pos.symbol,
+            pos.side,
+            pos.qty,
+            pos.entry_price,
+            pos.stop_loss,
+            pos.tp1_price,
         )
-
         self._notify(
-            f"🟢 Pozisyon Açıldı [{strategy_tag}]\n"
-            f"Sembol: {symbol} | Yön: {signal.side.upper()}\n"
-            f"Giriş: {entry_price:.4f} | SL: {sizing.stop_loss:.4f} | TP: {sizing.take_profit:.4f}\n"
+            f"Pozisyon acildi [{strategy_tag}]\n"
+            f"Sembol: {symbol} | Yon: {signal.side.upper()}\n"
+            f"Giris: {entry_price:.4f} | SL: {pos.stop_loss:.4f} | TP1: {pos.tp1_price:.4f}\n"
             f"Skor: {signal.score:.1f}/100"
         )
 
-    def _update_trailing_stop(self, pos: Position, price: float) -> None:
-        d = self.trail_distance.get(pos.id, abs(pos.entry_price - pos.stop_loss))
-        if d <= 0:
-            return
-        if pos.side == "long":
-            new_sl = price - d
-            if new_sl > pos.stop_loss:          # entry koşulu kaldırıldı (DÜZELTME)
-                old_sl = pos.stop_loss
-                pos.stop_loss = new_sl
-                self.storage.update_position_sl(pos.id, new_sl)
-                logger.debug("Trailing SL updated (LONG): %.4f → %.4f", old_sl, new_sl)
-        else:
-            new_sl = price + d
-            if new_sl < pos.stop_loss:          # entry koşulu kaldırıldı (DÜZELTME)
-                old_sl = pos.stop_loss
-                pos.stop_loss = new_sl
-                self.storage.update_position_sl(pos.id, new_sl)
-                logger.debug("Trailing SL updated (SHORT): %.4f → %.4f", old_sl, new_sl)
+    def _close_trade(self, pos: Position, exit_price: float, reason: str, qty: float) -> float:
+        pnl = (
+            (exit_price - pos.entry_price) * qty
+            if pos.side == "long"
+            else (pos.entry_price - exit_price) * qty
+        )
+        entry_notional = pos.entry_price * qty
+        exit_notional = exit_price * qty
+        fee = self.risk.fee_cost(entry_notional) + self.risk.fee_cost(exit_notional)
+        pnl_after_fee = pnl - fee
+        self.cash += pnl_after_fee
+        self.storage.add_trade(
+            TradeRecord(
+                position_id=pos.id,
+                symbol=pos.symbol,
+                side=pos.side,
+                entry_price=pos.entry_price,
+                exit_price=exit_price,
+                qty=qty,
+                pnl_usd=pnl_after_fee,
+                pnl_pct=(pnl_after_fee / max(1e-9, pos.entry_price * qty)) * 100,
+                opened_at=pos.opened_at,
+                closed_at=datetime.now(timezone.utc),
+                reason=reason,
+            )
+        )
+        return pnl_after_fee
 
-    def _update_open_positions_for_symbol(self, symbol: str, price: float) -> None:
+    def _update_trailing_stop(self, pos: Position, price: float) -> None:
+        if not pos.trailing_active or pos.trail_callback_pct <= 0:
+            return
+        callback_ratio = pos.trail_callback_pct / 100.0
+        if pos.side == "long":
+            new_sl = price * (1.0 - callback_ratio)
+            if new_sl > pos.stop_loss:
+                pos.stop_loss = new_sl
+                self.storage.update_position(pos)
+        else:
+            new_sl = price * (1.0 + callback_ratio)
+            if new_sl < pos.stop_loss:
+                pos.stop_loss = new_sl
+                self.storage.update_position(pos)
+
+    def _update_open_positions_for_symbol(self, symbol: str, price: float, bar_ts: int) -> None:
         remaining: list[Position] = []
         for pos in self.open_positions:
             if pos.symbol != symbol:
                 remaining.append(pos)
                 continue
+
+            if not pos.tp1_hit:
+                tp1_reached = price >= pos.tp1_price if pos.side == "long" else price <= pos.tp1_price
+                if tp1_reached:
+                    close_qty = min(
+                        pos.qty,
+                        max(pos.initial_qty * (self.settings.risk.tp1_close_pct / 100.0), 0.0),
+                    )
+                    if close_qty > 0:
+                        exit_price = price
+                        if not self.settings.app.paper_mode:
+                            exit_price = self.exchange.close_position(pos.symbol, pos.side, close_qty)
+                        pnl_after_fee = self._close_trade(pos, exit_price, "TP1", close_qty)
+                        pos.qty -= close_qty
+                        pos.tp1_hit = True
+                        pos.stop_loss = pos.break_even_price
+                        pos.trailing_active = False
+                        if pos.qty <= 0:
+                            self.storage.delete_position(pos.id)
+                            self.trail_distance.pop(pos.id, None)
+                            self._start_cooldown(pos.symbol, bar_ts)
+                            self._notify(
+                                f"Pozisyon kapandi\n"
+                                f"Sembol: {pos.symbol} | Yon: {pos.side.upper()} | Sebep: TP1\n"
+                                f"PNL: ${pnl_after_fee:.4f}"
+                            )
+                            continue
+                        self.storage.update_position(pos)
+                        self._notify(
+                            f"Pozisyon parcali kapandi\n"
+                            f"Sembol: {pos.symbol} | Yon: {pos.side.upper()} | Sebep: TP1\n"
+                            f"Kalan miktar: {pos.qty:.6f} | PNL: ${pnl_after_fee:.4f}"
+                        )
+
+            if not pos.trailing_active:
+                activation_hit = (
+                    price >= pos.trail_activation_price
+                    if pos.side == "long"
+                    else price <= pos.trail_activation_price
+                )
+                if activation_hit:
+                    pos.trailing_active = True
+                    self.storage.update_position(pos)
 
             self._update_trailing_stop(pos, price)
 
@@ -530,26 +564,16 @@ class TradeEngine:
             if pos.side == "long":
                 if price <= pos.stop_loss:
                     close_reason = "SL"
-                elif price >= pos.take_profit:
-                    close_reason = "TP"
             else:
                 if price >= pos.stop_loss:
                     close_reason = "SL"
-                elif price <= pos.take_profit:
-                    close_reason = "TP"
 
-            # Max pozisyon süresi kontrolü
             if not close_reason:
                 max_hours = self.settings.risk.max_position_duration_hours
                 if max_hours > 0:
-                    age_hours = (
-                        datetime.now(timezone.utc) - pos.opened_at
-                    ).total_seconds() / 3600.0
+                    age_hours = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 3600.0
                     if age_hours >= max_hours:
                         close_reason = "TIMEOUT"
-                        logger.info(
-                            "Position %s timed out after %.1f hours", pos.id, age_hours
-                        )
 
             if not close_reason:
                 remaining.append(pos)
@@ -557,42 +581,21 @@ class TradeEngine:
 
             exit_price = price
             if not self.settings.app.paper_mode:
-                self.exchange.cancel_all_orders(pos.symbol)
                 exit_price = self.exchange.close_position(pos.symbol, pos.side, pos.qty)
-
-            pnl = self._realized_pnl(pos, exit_price)
-            entry_notional = pos.entry_price * pos.qty * self.settings.risk.leverage
-            exit_notional = exit_price * pos.qty * self.settings.risk.leverage
-            fee = self.risk.fee_cost(entry_notional) + self.risk.fee_cost(exit_notional)
-            pnl_after_fee = pnl - fee
-            self.cash += pnl_after_fee
-
-            rec = TradeRecord(
-                position_id=pos.id,
-                symbol=pos.symbol,
-                side=pos.side,
-                entry_price=pos.entry_price,
-                exit_price=exit_price,
-                qty=pos.qty,
-                pnl_usd=pnl_after_fee,
-                pnl_pct=(pnl_after_fee / max(1e-9, pos.entry_price * pos.qty)) * 100,
-                opened_at=pos.opened_at,
-                closed_at=datetime.now(timezone.utc),
-                reason=close_reason,
-            )
-            self.storage.add_trade(rec)
+            pnl_after_fee = self._close_trade(pos, exit_price, close_reason, pos.qty)
             self.storage.delete_position(pos.id)
             self.trail_distance.pop(pos.id, None)
-
+            self._start_cooldown(pos.symbol, bar_ts)
             logger.info(
                 "Position closed: id=%s symbol=%s reason=%s pnl=%.4f",
-                pos.id, pos.symbol, close_reason, pnl_after_fee,
+                pos.id,
+                pos.symbol,
+                close_reason,
+                pnl_after_fee,
             )
-
-            pnl_sign = "🟢" if pnl_after_fee >= 0 else "🔴"
             self._notify(
-                f"{pnl_sign} Pozisyon Kapandı\n"
-                f"Sembol: {pos.symbol} | Yön: {pos.side.upper()} | Sebep: {close_reason}\n"
+                f"Pozisyon kapandi\n"
+                f"Sembol: {pos.symbol} | Yon: {pos.side.upper()} | Sebep: {close_reason}\n"
                 f"PNL: ${pnl_after_fee:.4f}"
             )
 
@@ -611,16 +614,12 @@ class TradeEngine:
                 total += self._realized_pnl(pos, current)
         return total
 
-    # ─── Notifications ────────────────────────────────────────────────────────
-
     def _notify(self, message: str) -> None:
         if self.telegram:
             try:
                 self.telegram.send(message)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Telegram notify failed: %s", exc)
-
-    # ─── Snapshot ─────────────────────────────────────────────────────────────
 
     def snapshot(self) -> EngineSnapshot:
         with self.lock:

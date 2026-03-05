@@ -1,10 +1,3 @@
-"""LuxAlgo strategy implementation for structure, order blocks, and FVGs.
-
-Signal conditions:
-  - Swing CHoCH/BOS break (leg-based, close crossover)
-  - Price inside active OB and trend filter (EMA50/200) aligned
-  - Entry after waiting for confirm_bars
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,176 +14,58 @@ logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
-class Pivot:
-    level: float = float("nan")
-    bar_idx: int = -1
-    crossed: bool = False
-
-
-@dataclass(slots=True)
-class OB:
-    side: str
-    top: float
-    bottom: float
-    bar_idx: int
-    active: bool = True
-
-
-@dataclass(slots=True)
-class FVG:
-    side: str
-    top: float
-    bottom: float
-    active: bool = True
-
-
-@dataclass(slots=True)
 class PendingSignal:
     side: str
     kind: str
-    price: float
-    note: str
     remaining: int
-    score: float = 0.0
-    context: dict[str, object] | None = None
+    note: str
+    context: dict[str, object]
 
+
+@dataclass(slots=True)
+class OrderBlock:
+    idx: int
+    top: float
+    bottom: float
+    side: str  # bull or bear
 
 class LuxAlgoStrategy:
+    """Lux Algo + Smart Money Concepts (SMC) hybrid strategy.
+
+    Uses market structure (BOS/CHOCH), order blocks, trend filters,
+    and candle confirmation to generate high-probability signals.
+    Targets ~63%+ win rate with confluence scoring system.
+    """
+
     def __init__(self, cfg: StrategyConfig) -> None:
         self.cfg = cfg
-        self.swing_lb = max(cfg.swing_lookback, 5)
-        self.internal_lb = max(cfg.pivot_lookback, 3)
-
-        self._swing_high = Pivot()
-        self._swing_low = Pivot()
-        self._internal_high = Pivot()
-        self._internal_low = Pivot()
-
-        self._swing_leg: int = -1
-        self._internal_leg: int = -1
-
-        self._swing_trend: int = 0
-        self._internal_trend: int = 0
-
-        self.order_blocks: list[OB] = []
-        self.fvgs: list[FVG] = []
         self.pending_signal: PendingSignal | None = None
         self.last_bar_ts: int | None = None
+        self.cooldown_remaining = 0
+        # SMC state
+        self.swing_highs: list[tuple[int, float]] = []
+        self.swing_lows: list[tuple[int, float]] = []
+        self.last_sh_price = 0.0
+        self.last_sl_price = 0.0
+        self.last_sh_idx = -1
+        self.last_sl_idx = -1
+        self.current_trend = 0  # 1=bull, -1=bear
+        self.last_break_bar = -20
+        self.last_break_type: str | None = None
+        self.order_blocks: list[OrderBlock] = []
+        self.bar_count = 0
 
-    def _calc_leg(self, highs: np.ndarray, lows: np.ndarray, size: int) -> int:
-        if len(highs) < size + 2:
-            return -1
-        pivot_h = highs[-(size + 1)]
-        pivot_l = lows[-(size + 1)]
-        window_h = highs[-size:]
-        window_l = lows[-size:]
-        new_leg_high = pivot_h > window_h.max()
-        new_leg_low = pivot_l < window_l.min()
-        if new_leg_high:
-            return 0
-        if new_leg_low:
-            return 1
-        return -1
+    # ── Indicator helpers ──
 
-    def _parsed_hl(
-        self, highs: np.ndarray, lows: np.ndarray, atr200: float
-    ) -> tuple[np.ndarray, np.ndarray]:
-        bar_range = highs - lows
-        high_vol = bar_range >= 2 * atr200
-        parsed_h = np.where(high_vol, lows, highs)
-        parsed_l = np.where(high_vol, highs, lows)
-        return parsed_h, parsed_l
+    def _ema(self, series: pd.Series, period: int) -> pd.Series:
+        return series.ewm(span=max(period, 2), adjust=False).mean()
 
-    def _store_ob(
-        self,
-        side: str,
-        pivot_idx: int,
-        current_idx: int,
-        parsed_h: np.ndarray,
-        parsed_l: np.ndarray,
-    ) -> None:
-        if pivot_idx < 0 or current_idx <= pivot_idx:
-            return
-        start = pivot_idx
-        end = current_idx
-
-        if side == "long":
-            sub = parsed_l[start:end]
-            if len(sub) == 0:
-                return
-            local_idx = int(np.argmin(sub)) + start
-        else:
-            sub = parsed_h[start:end]
-            if len(sub) == 0:
-                return
-            local_idx = int(np.argmax(sub)) + start
-
-        ob_top = float(parsed_h[local_idx])
-        ob_bottom = float(parsed_l[local_idx])
-
-        for existing in self.order_blocks:
-            if existing.bar_idx == local_idx and existing.side == side:
-                return
-
-        self.order_blocks.append(
-            OB(side=side, top=ob_top, bottom=ob_bottom, bar_idx=local_idx, active=True)
-        )
-        if len(self.order_blocks) > 20:
-            self.order_blocks.pop(0)
-
-    def _invalidate_obs(self, close: float, high: float, low: float) -> None:
-        for ob in self.order_blocks:
-            if not ob.active:
-                continue
-            if ob.side == "short" and high >= ob.top:
-                ob.active = False
-            elif ob.side == "long" and low <= ob.bottom:
-                ob.active = False
-        self.order_blocks = [ob for ob in self.order_blocks if ob.active]
-
-    def _update_fvg(self, df: pd.DataFrame) -> None:
-        if len(df) < 3:
-            return
-        h2 = float(df["high"].iloc[-3])
-        l2 = float(df["low"].iloc[-3])
-        h0 = float(df["high"].iloc[-1])
-        l0 = float(df["low"].iloc[-1])
-        c1 = float(df["close"].iloc[-2])
-
-        if l0 > h2 and c1 > h2:
-            self.fvgs.append(FVG(side="long", top=l0, bottom=h2))
-        if h0 < l2 and c1 < l2:
-            self.fvgs.append(FVG(side="short", top=l2, bottom=h0))
-
-        close = float(df["close"].iloc[-1])
-        for g in self.fvgs:
-            if g.side == "long" and close <= g.bottom:
-                g.active = False
-            if g.side == "short" and close >= g.top:
-                g.active = False
-        self.fvgs = [g for g in self.fvgs if g.active][-20:]
-
-    def _trend(self, close_s: pd.Series) -> int:
-        if len(close_s) < 200:
-            return 0
-        e50 = close_s.ewm(span=50, adjust=False).mean().iloc[-1]
-        e200 = close_s.ewm(span=200, adjust=False).mean().iloc[-1]
-        c = close_s.iloc[-1]
-        if c > e50 > e200:
-            return 1
-        if c < e50 < e200:
-            return -1
-        return 0
-
-    def _in_ob(self, side: str, price: float) -> bool:
-        return any(
-            ob.side == side and ob.bottom <= price <= ob.top
-            for ob in self.order_blocks
-            if ob.active
-        )
-
-    def _has_fvg(self, side: str) -> bool:
-        return any(g.side == side for g in self.fvgs if g.active)
+    def _atr_series(self, df: pd.DataFrame, period: int) -> pd.Series:
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+        tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+        return tr.ewm(alpha=1 / max(period, 2), adjust=False).mean()
 
     def _rsi(self, close_s: pd.Series) -> float:
         period = max(int(self.cfg.rsi_period), 2)
@@ -207,241 +82,394 @@ class LuxAlgoStrategy:
         return float(100.0 - (100.0 / (1.0 + rs)))
 
     def _volume_ratio(self, df: pd.DataFrame) -> float:
-        if "volume" not in df or len(df) < max(int(self.cfg.volume_ma_period), 2):
-            return 0.0
         period = max(int(self.cfg.volume_ma_period), 2)
-        vol = df["volume"]
+        if "volume" not in df or len(df) < period:
+            return 0.0
+        vol = df["volume"].astype(float)
         avg = vol.rolling(period).mean().iloc[-1]
         if pd.isna(avg) or avg <= 0:
             return 0.0
         return float(vol.iloc[-1] / avg)
 
-    def _adx(self, df: pd.DataFrame) -> float:
-        period = max(int(self.cfg.adx_period), 2)
-        if len(df) < period + 2:
-            return 0.0
+    # ── SMC: Swing detection ──
 
+    def _detect_swing(self, df: pd.DataFrame, lookback: int = 5) -> None:
+        """Detect swing highs/lows and update structure state."""
+        n = len(df)
+        if n < lookback * 2 + 1:
+            return
         high = df["high"].astype(float)
         low = df["low"].astype(float)
-        close = df["close"].astype(float)
+        idx = n - lookback - 1  # candidate index
+        if idx < lookback:
+            return
+        # Check swing high
+        h_val = float(high.iloc[idx])
+        is_sh = all(h_val > float(high.iloc[idx + d]) for d in range(-lookback, lookback + 1) if d != 0 and 0 <= idx + d < n)
+        if is_sh:
+            self.swing_highs.append((idx, h_val))
+            self.last_sh_price = h_val
+            self.last_sh_idx = idx
+            self.swing_highs = self.swing_highs[-50:]
+        # Check swing low
+        l_val = float(low.iloc[idx])
+        is_sl = all(l_val < float(low.iloc[idx + d]) for d in range(-lookback, lookback + 1) if d != 0 and 0 <= idx + d < n)
+        if is_sl:
+            self.swing_lows.append((idx, l_val))
+            self.last_sl_price = l_val
+            self.last_sl_idx = idx
+            self.swing_lows = self.swing_lows[-50:]
 
-        up_move = high.diff()
-        down_move = -low.diff()
-        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    # ── SMC: Market Structure (BOS / CHOCH) ──
 
-        tr = pd.concat(
-            [
-                high - low,
-                (high - close.shift(1)).abs(),
-                (low - close.shift(1)).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        atr = tr.ewm(alpha=1 / period, adjust=False).mean()
-        if atr.iloc[-1] <= 0 or pd.isna(atr.iloc[-1]):
-            return 0.0
+    def _detect_structure_break(self, close_val: float, bar_idx: int) -> str | None:
+        """Detect BOS or CHOCH. Returns break type or None."""
+        if self.last_sh_price <= 0 or self.last_sl_price <= 0:
+            return None
+        if bar_idx - self.last_break_bar < 3:
+            return None
 
-        plus_di = 100.0 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr
-        minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr
-        di_sum = plus_di + minus_di
-        if di_sum.iloc[-1] <= 0 or pd.isna(di_sum.iloc[-1]):
-            return 0.0
-        dx = ((plus_di - minus_di).abs() / di_sum.replace(0.0, np.nan)) * 100.0
-        adx = dx.ewm(alpha=1 / period, adjust=False).mean().iloc[-1]
-        return 0.0 if pd.isna(adx) else float(adx)
+        if close_val > self.last_sh_price and bar_idx > self.last_sh_idx:
+            if self.current_trend >= 0:
+                break_type = "BOS_UP"
+            else:
+                break_type = "CHOCH_UP"
+            self.current_trend = 1
+            self.last_break_bar = bar_idx
+            self.last_break_type = break_type
+            self.last_sh_price = close_val
+            self.last_sh_idx = bar_idx
+            return break_type
 
-    def _cvd_bias(self, df: pd.DataFrame) -> float:
-        lookback = max(int(self.cfg.cvd_lookback), 5)
-        if "volume" not in df or len(df) < lookback:
-            return 0.0
-        window = df.iloc[-lookback:]
-        signed_volume = np.where(
-            window["close"] > window["open"],
-            window["volume"],
-            np.where(window["close"] < window["open"], -window["volume"], 0.0),
-        )
-        total_abs = float(np.abs(signed_volume).sum())
-        if total_abs <= 0:
-            return 0.0
-        return float(np.clip(signed_volume.sum() / total_abs, -1.0, 1.0))
+        if close_val < self.last_sl_price and bar_idx > self.last_sl_idx:
+            if self.current_trend <= 0:
+                break_type = "BOS_DOWN"
+            else:
+                break_type = "CHOCH_DOWN"
+            self.current_trend = -1
+            self.last_break_bar = bar_idx
+            self.last_break_type = break_type
+            self.last_sl_price = close_val
+            self.last_sl_idx = bar_idx
+            return break_type
+
+        return None
+
+    # ── SMC: Order Block detection ──
+
+    def _detect_order_block(self, df: pd.DataFrame, break_type: str, break_idx: int) -> None:
+        """Find order block before a structure break."""
+        close_arr = df["close"].astype(float)
+        open_arr = df["open"].astype(float)
+        if break_type in ("BOS_UP", "CHOCH_UP"):
+            for j in range(break_idx - 1, max(break_idx - 10, 0), -1):
+                if float(close_arr.iloc[j]) < float(open_arr.iloc[j]):
+                    o_val = float(open_arr.iloc[j])
+                    c_val = float(close_arr.iloc[j])
+                    self.order_blocks.append(OrderBlock(idx=j, top=max(o_val, c_val), bottom=min(o_val, c_val), side="bull"))
+                    break
+        elif break_type in ("BOS_DOWN", "CHOCH_DOWN"):
+            for j in range(break_idx - 1, max(break_idx - 10, 0), -1):
+                if float(close_arr.iloc[j]) > float(open_arr.iloc[j]):
+                    o_val = float(open_arr.iloc[j])
+                    c_val = float(close_arr.iloc[j])
+                    self.order_blocks.append(OrderBlock(idx=j, top=max(o_val, c_val), bottom=min(o_val, c_val), side="bear"))
+                    break
+        self.order_blocks = self.order_blocks[-60:]
+
+    # ── Candle pattern helpers ──
+
+    def _is_pin_bar(self, o: float, h: float, l: float, c: float, atr_val: float) -> int:
+        body = abs(c - o)
+        rng = h - l
+        if rng < atr_val * 0.3:
+            return 0
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        if lower_wick > body * 2 and lower_wick > rng * 0.5:
+            return 1  # bullish pin
+        if upper_wick > body * 2 and upper_wick > rng * 0.5:
+            return -1  # bearish pin
+        return 0
+
+    def _is_engulfing(self, o1: float, c1: float, o2: float, c2: float) -> int:
+        if c1 < o1 and c2 > o2 and c2 > o1 and o2 < c1:
+            return 1  # bullish engulfing
+        if c1 > o1 and c2 < o2 and c2 < o1 and o2 > c1:
+            return -1  # bearish engulfing
+        return 0
+
+    # ── Confluence scoring ──
+
+    def _calc_confluence(self, df: pd.DataFrame, htf_df: pd.DataFrame | None, bar_idx: int, atr_val: float) -> tuple[int, int, dict]:
+        """Calculate confluence score for long and short. Returns (long_score, short_score, context)."""
+        close_s = df["close"].astype(float)
+        close_val = float(close_s.iloc[-1])
+        open_val = float(df["open"].astype(float).iloc[-1])
+        high_val = float(df["high"].astype(float).iloc[-1])
+        low_val = float(df["low"].astype(float).iloc[-1])
+        sl_score = 0
+        ss_score = 0
+        ctx = {}
+
+        # 1. Market structure trend (2 pts)
+        if self.current_trend == 1:
+            sl_score += 2
+        elif self.current_trend == -1:
+            ss_score += 2
+        ctx["smc_trend"] = self.current_trend
+
+        # 2. Recent BOS/CHOCH (1 pt)
+        if self.last_break_type and bar_idx - self.last_break_bar <= 20:
+            if self.last_break_type in ("BOS_UP", "CHOCH_UP"):
+                sl_score += 1
+            else:
+                ss_score += 1
+        ctx["last_break"] = self.last_break_type or "none"
+
+        # 3. Order Block retest (2 pts)
+        ob_buffer = atr_val * 0.3
+        ob_max_age = 50
+        ob_long = None
+        ob_short = None
+        for ob in self.order_blocks:
+            if bar_idx - ob.idx > ob_max_age:
+                continue
+            if ob.side == "bull" and low_val <= ob.top + ob_buffer and close_val >= ob.bottom - ob_buffer:
+                ob_long = ob
+                break
+        for ob in self.order_blocks:
+            if bar_idx - ob.idx > ob_max_age:
+                continue
+            if ob.side == "bear" and high_val >= ob.bottom - ob_buffer and close_val <= ob.top + ob_buffer:
+                ob_short = ob
+                break
+        if ob_long:
+            sl_score += 2
+        if ob_short:
+            ss_score += 2
+        ctx["ob_long"] = ob_long is not None
+        ctx["ob_short"] = ob_short is not None
+
+        # 4. EMA trend filter (1 pt)
+        ema_fast = self._ema(close_s, int(self.cfg.ema_fast_period))
+        ema_slow = self._ema(close_s, int(self.cfg.ema_slow_period))
+        ema_fast_val = float(ema_fast.iloc[-1])
+        ema_slow_val = float(ema_slow.iloc[-1])
+        ema_bull = ema_fast_val > ema_slow_val
+        ema_bear = ema_fast_val < ema_slow_val
+        if ema_bull:
+            sl_score += 1
+        if ema_bear:
+            ss_score += 1
+        ctx["ema_fast"] = ema_fast_val
+        ctx["ema_slow"] = ema_slow_val
+
+        # 5. EMA200 major trend (1 pt)
+        ema200 = self._ema(close_s, 200)
+        ema200_val = float(ema200.iloc[-1]) if len(close_s) >= 200 else close_val
+        if close_val > ema200_val:
+            sl_score += 1
+        elif close_val < ema200_val:
+            ss_score += 1
+        ctx["ema200"] = ema200_val
+
+        # 6. HTF trend alignment (1 pt)
+        htf_trend = 0
+        if htf_df is not None and not htf_df.empty and len(htf_df) > 60:
+            htf_close = htf_df["close"].astype(float)
+            htf_ema_f = self._ema(htf_close, int(self.cfg.ema_fast_period))
+            htf_ema_s = self._ema(htf_close, int(self.cfg.ema_slow_period))
+            hc = float(htf_close.iloc[-1])
+            hf = float(htf_ema_f.iloc[-1])
+            hs = float(htf_ema_s.iloc[-1])
+            if hc > hf > hs:
+                htf_trend = 1
+            elif hc < hf < hs:
+                htf_trend = -1
+        if htf_trend == 1:
+            sl_score += 1
+        elif htf_trend == -1:
+            ss_score += 1
+        ctx["htf_trend"] = htf_trend
+
+        # 7. Candle confirmation (2 pts)
+        pin = self._is_pin_bar(open_val, high_val, low_val, close_val, atr_val)
+        eng = 0
+        if len(df) >= 2:
+            eng = self._is_engulfing(float(df["open"].iloc[-2]), float(df["close"].iloc[-2]), open_val, close_val)
+        if pin == 1 or eng == 1:
+            sl_score += 2
+        if pin == -1 or eng == -1:
+            ss_score += 2
+        ctx["pin_bar"] = pin
+        ctx["engulfing"] = eng
+
+        # 8. Bullish/bearish candle (1 pt)
+        candle_range = high_val - low_val
+        body_ratio = abs(close_val - open_val) / candle_range if candle_range > 0 else 0
+        candle_ok_l = pin == 1 or eng == 1 or (close_val > open_val and body_ratio > 0.5)
+        candle_ok_s = pin == -1 or eng == -1 or (close_val < open_val and body_ratio > 0.5)
+        if close_val > open_val:
+            sl_score += 1
+        if close_val < open_val:
+            ss_score += 1
+
+        # 9. Volume (1 pt)
+        vol_ratio = self._volume_ratio(df)
+        if vol_ratio >= 1.2:
+            sl_score += 1
+            ss_score += 1
+        ctx["volume_ratio"] = vol_ratio
+
+        # RSI
+        rsi_val = self._rsi(close_s)
+        ctx["rsi"] = rsi_val
+        ctx["atr"] = atr_val
+        ctx["atr_pct"] = (atr_val / close_val) * 100 if close_val > 0 else 0
+        ctx["long_score"] = sl_score
+        ctx["short_score"] = ss_score
+        ctx["ema_bull"] = ema_bull
+        ctx["ema_bear"] = ema_bear
+        ctx["ob_long_obj"] = ob_long
+        ctx["ob_short_obj"] = ob_short
+        ctx["candle_ok_l"] = candle_ok_l
+        ctx["candle_ok_s"] = candle_ok_s
+
+        return sl_score, ss_score, ctx
+
+    # ── Main signal generation ──
 
     def next_signal(self, df: pd.DataFrame, htf_df: pd.DataFrame | None = None) -> Signal | None:
-        min_bars = max(self.swing_lb, self.internal_lb) * 2 + 10
-        if len(df) < min_bars:
+        warmup = max(200, int(self.cfg.ema_slow_period) + 10, int(self.cfg.breakout_lookback) + 10)
+        if len(df) < warmup:
             return None
 
         bar_ts = int(df["ts"].iloc[-1])
         if self.last_bar_ts == bar_ts:
             return None
         self.last_bar_ts = bar_ts
+        self.bar_count = len(df) - 1
 
-        highs = df["high"].values.astype(float)
-        lows = df["low"].values.astype(float)
-        closes = df["close"].values.astype(float)
-        close = closes[-1]
-        high = highs[-1]
-        low = lows[-1]
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
 
-        atr200 = float(
-            np.mean(
-                np.maximum(
-                    highs[1:] - lows[1:],
-                    np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])),
-                )[-200:]
-            )
+        # Step 1: Detect swings
+        self._detect_swing(df, lookback=int(self.cfg.pivot_lookback))
+
+        # Step 2: Detect structure breaks
+        close_val = float(df["close"].astype(float).iloc[-1])
+        break_type = self._detect_structure_break(close_val, self.bar_count)
+
+        # Step 3: Detect order blocks on break
+        if break_type:
+            self._detect_order_block(df, break_type, self.bar_count)
+
+        # Step 4: Calculate ATR
+        atr_series = self._atr_series(df, 14)
+        atr_val = float(atr_series.iloc[-1]) if len(atr_series) else 0.0
+        if atr_val <= 0:
+            return None
+        atr_pct = (atr_val / close_val) * 100 if close_val > 0 else 0
+
+        # Min volatility filter
+        if atr_pct < float(self.cfg.min_atr_pct):
+            return None
+
+        # Cooldown check
+        if self.cooldown_remaining > 0:
+            return None
+
+        # Step 5: Confluence scoring
+        long_score, short_score, ctx = self._calc_confluence(df, htf_df, self.bar_count, atr_val)
+
+        # Step 6: Entry decision
+        min_score = int(self.cfg.lux_signal_threshold / 10.0)  # config threshold / 10
+        if min_score < 5:
+            min_score = 10
+        rsi_val = float(ctx.get("rsi", 50))
+        vol_ratio = float(ctx.get("volume_ratio", 1.0))
+
+        side = ""
+        score = 0.0
+
+        # LONG entry
+        if (self.cfg.allow_long and
+                long_score >= min_score and
+                self.current_trend == 1 and
+                ctx.get("ob_long") and
+                ctx.get("ema_bull") and
+                ctx.get("candle_ok_l") and
+                25 < rsi_val < 75 and
+                vol_ratio >= 0.7):
+            side = "long"
+            score = float(long_score) * 10.0  # normalize to 0-100ish
+
+        # SHORT entry
+        elif (self.cfg.allow_short and
+                short_score >= min_score and
+                self.current_trend == -1 and
+                ctx.get("ob_short") and
+                ctx.get("ema_bear") and
+                ctx.get("candle_ok_s") and
+                25 < rsi_val < 75 and
+                vol_ratio >= 0.7):
+            side = "short"
+            score = float(short_score) * 10.0
+
+        if not side:
+            return None
+
+        # Build context
+        context = {
+            "rsi": rsi_val,
+            "atr": atr_val,
+            "atr_pct": atr_pct,
+            "volume_ratio": vol_ratio,
+            "trend": self.current_trend,
+            "htf_trend": ctx.get("htf_trend", 0),
+            "ema_fast": ctx.get("ema_fast", 0),
+            "ema_slow": ctx.get("ema_slow", 0),
+            "lux_strength": score,
+            "smc_break": self.last_break_type or "none",
+            "long_confluence": long_score,
+            "short_confluence": short_score,
+        }
+        note = (
+            "SMC " + ("BUY" if side == "long" else "SELL")
+            + " | score " + str(int(score))
+            + " | " + (self.last_break_type or "")
+            + " | RSI " + ("%.1f" % rsi_val)
+            + " | ATR%% %.2f" % atr_pct
         )
-        parsed_h, parsed_l = self._parsed_hl(highs, lows, atr200)
 
-        current_idx = len(df) - 1
-        new_swing_leg = self._calc_leg(highs, lows, self.swing_lb)
-
-        if new_swing_leg != -1 and new_swing_leg != self._swing_leg:
-            self._swing_leg = new_swing_leg
-            pivot_bar = current_idx - self.swing_lb
-            if new_swing_leg == 0:
-                self._swing_high = Pivot(level=float(highs[pivot_bar]), bar_idx=pivot_bar, crossed=False)
-            else:
-                self._swing_low = Pivot(level=float(lows[pivot_bar]), bar_idx=pivot_bar, crossed=False)
-
-        new_int_leg = self._calc_leg(highs, lows, self.internal_lb)
-
-        if new_int_leg != -1 and new_int_leg != self._internal_leg:
-            self._internal_leg = new_int_leg
-            pivot_bar = current_idx - self.internal_lb
-            if new_int_leg == 0:
-                self._internal_high = Pivot(
-                    level=float(highs[pivot_bar]), bar_idx=pivot_bar, crossed=False
-                )
-            else:
-                self._internal_low = Pivot(level=float(lows[pivot_bar]), bar_idx=pivot_bar, crossed=False)
-
-        self._update_fvg(df)
-        self._invalidate_obs(close, high, low)
-
-        raw_signal: Signal | None = None
-        sh_level = self._swing_high.level
-        sl_level = self._swing_low.level
-
-        if not np.isnan(sh_level) and not self._swing_high.crossed and close > sh_level:
-            kind = "choch" if self._swing_trend == -1 else "bos"
-            self._swing_high.crossed = True
-            self._swing_trend = 1
-            self._store_ob("long", self._swing_high.bar_idx, current_idx, parsed_h, parsed_l)
-            raw_signal = self._make_signal("long", kind, df, htf_df)
-        elif not np.isnan(sl_level) and not self._swing_low.crossed and close < sl_level:
-            kind = "choch" if self._swing_trend == 1 else "bos"
-            self._swing_low.crossed = True
-            self._swing_trend = -1
-            self._store_ob("short", self._swing_low.bar_idx, current_idx, parsed_h, parsed_l)
-            raw_signal = self._make_signal("short", kind, df, htf_df)
-
-        if self.pending_signal is not None:
-            ps = self.pending_signal
-            ps.remaining -= 1
-            if ps.remaining <= 0:
-                self.pending_signal = None
-                sig = self._make_signal(ps.side, ps.kind, df, htf_df)
-                if sig is None:
-                    logger.info("LuxAlgo signal rejected after confirm: %s %s", ps.side, ps.kind)
-                    return None
-                logger.info("LuxAlgo signal confirmed: %s %s @ %.2f", sig.side, sig.kind, sig.price)
-                return sig
-            return None
-
-        if raw_signal is not None:
-            confirm = max(1, int(self.cfg.confirm_bars))
-            self.pending_signal = PendingSignal(
-                side=raw_signal.side,
-                kind=raw_signal.kind,
-                price=raw_signal.price,
-                note=raw_signal.note,
-                remaining=confirm,
-                score=raw_signal.score,
-                context=dict(raw_signal.context),
-            )
-            logger.info(
-                "LuxAlgo signal queued: %s %s @ %.2f (confirm=%d)",
-                raw_signal.side,
-                raw_signal.kind,
-                raw_signal.price,
-                confirm,
-            )
-
-        return None
-
-    def _make_signal(
-        self,
-        side: str,
-        kind: str,
-        df: pd.DataFrame,
-        htf_df: pd.DataFrame | None = None,
-    ) -> Signal | None:
-        if self.cfg.use_choch_only and kind != "choch":
-            return None
-        if side == "long" and not self.cfg.allow_long:
-            return None
-        if side == "short" and not self.cfg.allow_short:
-            return None
-
-        close = float(df["close"].iloc[-1])
-        close_s = df["close"]
-        trend = self._trend(close_s)
-        htf_close_s = htf_df["close"] if htf_df is not None and not htf_df.empty else close_s
-        htf_trend = self._trend(htf_close_s)
-
-        if self.cfg.ema_trend_filter:
-            if side == "long" and trend == -1:
-                return None
-            if side == "short" and trend == 1:
-                return None
-
-        if self.cfg.htf_trend_filter:
-            if side == "long" and htf_trend != 1:
-                return None
-            if side == "short" and htf_trend != -1:
-                return None
-
-        rsi = self._rsi(close_s)
-        adx = self._adx(df)
-        cvd_bias = self._cvd_bias(df)
-        volume_ratio = self._volume_ratio(df)
-
-        if self.cfg.volume_filter:
-            if volume_ratio < float(self.cfg.min_volume_ratio):
-                return None
-
-        ob_ok = self._in_ob(side, close)
-        fvg_ok = self._has_fvg(side)
-
-        if self.cfg.use_ob_fvg_filter and (self.order_blocks or self.fvgs):
-            if not ob_ok and not fvg_ok:
-                return None
-
-        note_parts = [f"LuxAlgo {kind.upper()}"]
-        if ob_ok:
-            note_parts.append("OB")
-        if fvg_ok:
-            note_parts.append("FVG")
-        note_parts.append(f"RSI {rsi:.1f}")
-        note_parts.append(f"ADX {adx:.1f}")
-        note_parts.append(f"CVD {cvd_bias:+.2f}")
-        note_parts.append(f"VOL x{volume_ratio:.2f}")
-
-        return Signal(
+        signal = Signal(
             ts=datetime.now(timezone.utc),
             side=side,
-            kind=kind,
-            price=close,
-            note=" | ".join(note_parts),
-            context={
-                "rsi": rsi,
-                "adx": adx,
-                "cvd_bias": cvd_bias,
-                "volume_ratio": volume_ratio,
-                "trend": trend,
-                "htf_trend": htf_trend,
-                "ob_ok": ob_ok,
-                "fvg_ok": fvg_ok,
-            },
+            kind="mcp",
+            price=close_val,
+            note=note,
+            score=score,
+            context=context,
         )
+
+        confirm = max(1, int(self.cfg.confirm_bars))
+        if confirm <= 1:
+            self.cooldown_remaining = max(int(self.cfg.cooldown_bars), 0)
+            return signal
+
+        if self.pending_signal is None:
+            self.pending_signal = PendingSignal(
+                side=signal.side, kind=signal.kind,
+                remaining=confirm - 1, note=signal.note,
+                context=dict(signal.context),
+            )
+            return None
+
+        self.pending_signal.remaining -= 1
+        if self.pending_signal.remaining <= 0 and self.pending_signal.side == signal.side:
+            self.pending_signal = None
+            self.cooldown_remaining = max(int(self.cfg.cooldown_bars), 0)
+            return signal
+
+        return None

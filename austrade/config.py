@@ -69,6 +69,8 @@ class RiskConfig:
     trailing_callback_max_pct: float = 3.00
     trailing_activation_min_pct: float = 0.50
     trailing_activation_max_pct: float = 5.00
+    tp1_atr_mult: float = 1.5
+    tp1_close_pct: float = 50.0
 
 
 @dataclass(slots=True)
@@ -98,6 +100,16 @@ class StrategyConfig:
     onchain_weight: float = 0.25
     sentiment_weight: float = 0.10
     regime_weight: float = 0.25
+    ema_fast_period: int = 21
+    ema_slow_period: int = 55
+    ema_slope_lookback: int = 5
+    ema_flat_threshold_pct: float = 0.08
+    min_atr_pct: float = 0.25
+    breakout_lookback: int = 20
+    rsi_long_min: float = 40.0
+    rsi_short_max: float = 60.0
+    lux_signal_threshold: float = 70.0
+    cooldown_bars: int = 12
 
 
 @dataclass(slots=True)
@@ -208,6 +220,8 @@ def load_settings(path: str | Path = "config.json") -> Settings:
             trailing_callback_max_pct=float(risk.get("trailing_callback_max_pct", 3.00)),
             trailing_activation_min_pct=float(risk.get("trailing_activation_min_pct", 0.50)),
             trailing_activation_max_pct=float(risk.get("trailing_activation_max_pct", 5.00)),
+            tp1_atr_mult=float(risk.get("tp1_atr_mult", 1.5)),
+            tp1_close_pct=float(risk.get("tp1_close_pct", 50.0)),
         ),
         strategy=StrategyConfig(
             pivot_lookback=int(strat["pivot_lookback"]),
@@ -235,6 +249,16 @@ def load_settings(path: str | Path = "config.json") -> Settings:
             onchain_weight=float(strat.get("onchain_weight", 0.25)),
             sentiment_weight=float(strat.get("sentiment_weight", 0.10)),
             regime_weight=float(strat.get("regime_weight", 0.25)),
+            ema_fast_period=int(strat.get("ema_fast_period", 21)),
+            ema_slow_period=int(strat.get("ema_slow_period", 55)),
+            ema_slope_lookback=int(strat.get("ema_slope_lookback", 5)),
+            ema_flat_threshold_pct=float(strat.get("ema_flat_threshold_pct", 0.08)),
+            min_atr_pct=float(strat.get("min_atr_pct", 0.25)),
+            breakout_lookback=int(strat.get("breakout_lookback", 20)),
+            rsi_long_min=float(strat.get("rsi_long_min", 40.0)),
+            rsi_short_max=float(strat.get("rsi_short_max", 60.0)),
+            lux_signal_threshold=float(strat.get("lux_signal_threshold", 70.0)),
+            cooldown_bars=int(strat.get("cooldown_bars", 12)),
         ),
         storage=StorageConfig(**data["storage"]),
         telegram=TelegramConfig(

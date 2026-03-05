@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Literal
 
 Side = Literal["long", "short"]
-SignalKind = Literal["bos", "choch", "none", "triple"]
+SignalKind = Literal["bos", "choch", "none", "triple", "mcp"]
 
 
 @dataclass(slots=True)
@@ -30,6 +30,13 @@ class Position:
     take_profit: float
     opened_at: datetime
     status: str = "open"
+    initial_qty: float = 0.0
+    tp1_price: float = 0.0
+    tp1_hit: bool = False
+    break_even_price: float = 0.0
+    trail_callback_pct: float = 0.0
+    trail_activation_price: float = 0.0
+    trailing_active: bool = False
 
 
 @dataclass(slots=True)

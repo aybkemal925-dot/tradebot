@@ -48,6 +48,16 @@ CREATE TABLE IF NOT EXISTS open_positions (
 );
 """
 
+OPEN_POSITION_EXTRA_COLUMNS: dict[str, str] = {
+    "initial_qty": "REAL NOT NULL DEFAULT 0",
+    "tp1_price": "REAL NOT NULL DEFAULT 0",
+    "tp1_hit": "INTEGER NOT NULL DEFAULT 0",
+    "break_even_price": "REAL NOT NULL DEFAULT 0",
+    "trail_callback_pct": "REAL NOT NULL DEFAULT 0",
+    "trail_activation_price": "REAL NOT NULL DEFAULT 0",
+    "trailing_active": "INTEGER NOT NULL DEFAULT 0",
+}
+
 
 class Storage:
     def __init__(self, db_path: str) -> None:
@@ -59,9 +69,15 @@ class Storage:
 
     def _init_db(self) -> None:
         self.conn.executescript(SCHEMA)
+        self._ensure_open_position_columns()
         self.conn.commit()
 
-    # ─── Trade history ───────────────────────────────────────────────────────
+    def _ensure_open_position_columns(self) -> None:
+        cur = self.conn.execute("PRAGMA table_info(open_positions)")
+        existing = {str(row["name"]) for row in cur.fetchall()}
+        for name, ddl in OPEN_POSITION_EXTRA_COLUMNS.items():
+            if name not in existing:
+                self.conn.execute(f"ALTER TABLE open_positions ADD COLUMN {name} {ddl}")
 
     def add_trade(self, trade: TradeRecord) -> None:
         self.conn.execute(
@@ -88,18 +104,21 @@ class Storage:
         self.conn.commit()
         logger.info(
             "Trade saved: pos=%s symbol=%s side=%s pnl=%.4f",
-            trade.position_id, trade.symbol, trade.side, trade.pnl_usd,
+            trade.position_id,
+            trade.symbol,
+            trade.side,
+            trade.pnl_usd,
         )
 
     def recent_trades(self, limit: int = 100) -> list[dict[str, Any]]:
         cur = self.conn.execute(
-            "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT * FROM trades ORDER BY id DESC LIMIT ?",
+            (limit,),
         )
         return [dict(row) for row in cur.fetchall()]
 
     def today_pnl(self) -> float:
         today = datetime.now(timezone.utc).date().isoformat()
-        # DATE() index'i kullanarak substr() yerine — 100x daha hızlı
         cur = self.conn.execute(
             "SELECT COALESCE(SUM(pnl_usd), 0) AS s FROM trades WHERE DATE(closed_at) = ?",
             (today,),
@@ -113,12 +132,9 @@ class Storage:
         return float(row["s"] if row else 0.0)
 
     def peak_equity(self) -> float:
-        """Tüm zamanların en yüksek equity değerini döndür (drawdown hesabı için)."""
         cur = self.conn.execute("SELECT MAX(equity) AS m FROM balance_snapshots")
         row = cur.fetchone()
         return float(row["m"] if row and row["m"] is not None else 0.0)
-
-    # ─── Balance snapshots ───────────────────────────────────────────────────
 
     def add_snapshot(self, equity: float, daily_pnl: float) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -127,7 +143,6 @@ class Storage:
             (now, equity, daily_pnl),
         )
         self.conn.commit()
-        # Cleanup throttle: her 1000 snapshot'ta bir çalıştır (~2.8 saatte bir)
         self._cleanup_counter += 1
         if self._cleanup_counter >= 1000:
             self.cleanup_old_snapshots(days=7)
@@ -139,33 +154,51 @@ class Storage:
         self.conn.commit()
 
     def equity_curve(self, limit: int = 200) -> list[dict[str, Any]]:
-        """Son N equity snapshot'ını döndür (grafik için)."""
         cur = self.conn.execute(
-            "SELECT ts, equity FROM balance_snapshots ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT ts, equity FROM balance_snapshots ORDER BY id DESC LIMIT ?",
+            (limit,),
         )
         rows = [dict(r) for r in cur.fetchall()]
         rows.reverse()
         return rows
 
-    # ─── Open positions persistence ──────────────────────────────────────────
-
     def save_position(self, pos: Position) -> None:
         self.conn.execute(
             """
-            INSERT OR REPLACE INTO open_positions
-                (id, symbol, side, qty, entry_price, stop_loss, take_profit, opened_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO open_positions (
+                id, symbol, side, qty, entry_price, stop_loss, take_profit, opened_at, status,
+                initial_qty, tp1_price, tp1_hit, break_even_price,
+                trail_callback_pct, trail_activation_price, trailing_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                pos.id, pos.symbol, pos.side, pos.qty, pos.entry_price,
-                pos.stop_loss, pos.take_profit, pos.opened_at.isoformat(), pos.status,
+                pos.id,
+                pos.symbol,
+                pos.side,
+                pos.qty,
+                pos.entry_price,
+                pos.stop_loss,
+                pos.take_profit,
+                pos.opened_at.isoformat(),
+                pos.status,
+                pos.initial_qty,
+                pos.tp1_price,
+                int(pos.tp1_hit),
+                pos.break_even_price,
+                pos.trail_callback_pct,
+                pos.trail_activation_price,
+                int(pos.trailing_active),
             ),
         )
         self.conn.commit()
 
+    def update_position(self, pos: Position) -> None:
+        self.save_position(pos)
+
     def update_position_sl(self, pos_id: int, new_sl: float) -> None:
         self.conn.execute(
-            "UPDATE open_positions SET stop_loss=? WHERE id=?", (new_sl, pos_id)
+            "UPDATE open_positions SET stop_loss=? WHERE id=?",
+            (new_sl, pos_id),
         )
         self.conn.commit()
 
@@ -196,7 +229,20 @@ class Storage:
                 take_profit=float(row["take_profit"]),
                 opened_at=opened_at,
                 status=row["status"],
+                initial_qty=float(row["initial_qty"] or 0.0),
+                tp1_price=float(row["tp1_price"] or 0.0),
+                tp1_hit=bool(row["tp1_hit"]),
+                break_even_price=float(row["break_even_price"] or 0.0),
+                trail_callback_pct=float(row["trail_callback_pct"] or 0.0),
+                trail_activation_price=float(row["trail_activation_price"] or 0.0),
+                trailing_active=bool(row["trailing_active"]),
             )
+            if pos.initial_qty <= 0:
+                pos.initial_qty = pos.qty
+            if pos.tp1_price <= 0:
+                pos.tp1_price = pos.take_profit
+            if pos.break_even_price <= 0:
+                pos.break_even_price = pos.entry_price
             positions.append(pos)
 
         logger.info("Loaded %s open positions from DB", len(positions))
