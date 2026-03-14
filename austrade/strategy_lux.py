@@ -91,6 +91,38 @@ class LuxAlgoStrategy:
             return 0.0
         return float(vol.iloc[-1] / avg)
 
+    def _adx(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Calculate ADX (Average Directional Index) for trend strength."""
+        period = max(period, 2)
+        if len(df) < period * 2:
+            return 0.0
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+        # Directional movement
+        up_move = high.diff()
+        down_move = -low.diff()
+        pos_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        neg_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+        atr_s = tr.ewm(alpha=1 / period, adjust=False).mean()
+        pos_di = 100.0 * pd.Series(pos_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_s.replace(0, np.nan)
+        neg_di = 100.0 * pd.Series(neg_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_s.replace(0, np.nan)
+        dx = (100.0 * (pos_di - neg_di).abs() / (pos_di + neg_di).replace(0, np.nan)).fillna(0.0)
+        adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+        return float(adx.iloc[-1])
+
+    def _ema_slope(self, series: pd.Series, period: int, lookback: int = 5) -> float:
+        """Return EMA slope as pct change over lookback bars (positive = rising)."""
+        ema = self._ema(series, period)
+        if len(ema) < lookback + 1:
+            return 0.0
+        prev = float(ema.iloc[-(lookback + 1)])
+        curr = float(ema.iloc[-1])
+        if prev <= 0:
+            return 0.0
+        return (curr - prev) / prev * 100.0
+
     # ── SMC: Swing detection ──
 
     def _detect_swing(self, df: pd.DataFrame, lookback: int = 5) -> None:
@@ -317,10 +349,29 @@ class LuxAlgoStrategy:
 
         # 9. Volume (1 pt)
         vol_ratio = self._volume_ratio(df)
-        if vol_ratio >= 1.2:
+        vol_threshold = max(float(self.cfg.min_volume_ratio), 0.5)
+        if vol_ratio >= vol_threshold:
             sl_score += 1
             ss_score += 1
         ctx["volume_ratio"] = vol_ratio
+
+        # 10. ADX trend strength (1 pt) — only score if ADX is strong
+        adx_val = self._adx(df, int(self.cfg.adx_period))
+        adx_threshold = float(self.cfg.adx_threshold)
+        if adx_val >= adx_threshold:
+            sl_score += 1
+            ss_score += 1
+        ctx["adx"] = adx_val
+
+        # 11. EMA slope (1 pt) — reward rising/falling EMA momentum
+        slope_lookback = max(int(self.cfg.ema_slope_lookback), 2)
+        flat_thr = float(self.cfg.ema_flat_threshold_pct)
+        ema_slope = self._ema_slope(close_s, int(self.cfg.ema_fast_period), slope_lookback)
+        if ema_slope > flat_thr:
+            sl_score += 1
+        elif ema_slope < -flat_thr:
+            ss_score += 1
+        ctx["ema_slope"] = ema_slope
 
         # RSI
         rsi_val = self._rsi(close_s)
@@ -384,11 +435,23 @@ class LuxAlgoStrategy:
         long_score, short_score, ctx = self._calc_confluence(df, htf_df, self.bar_count, atr_val)
 
         # Step 6: Entry decision
-        min_score = int(self.cfg.lux_signal_threshold / 10.0)  # config threshold / 10
-        if min_score < 5:
-            min_score = 10
+        # min_score: normalize lux_signal_threshold (0-100 scale) to raw score (max ~15)
+        # lux_signal_threshold=70 → min_score=7, =80 → 8, =90 → 9
+        max_possible = 15  # updated with ADX and slope additions
+        min_score = max(5, round(float(self.cfg.lux_signal_threshold) / 100.0 * max_possible))
         rsi_val = float(ctx.get("rsi", 50))
         vol_ratio = float(ctx.get("volume_ratio", 1.0))
+        adx_val = float(ctx.get("adx", 0.0))
+
+        # RSI filters using config values (oversold for long, overbought for short)
+        rsi_ok_long = rsi_val < float(self.cfg.rsi_long_max) or (20.0 < rsi_val < 70.0)
+        rsi_ok_short = rsi_val > float(self.cfg.rsi_short_min) or (30.0 < rsi_val < 80.0)
+        # Always ensure RSI is not at extreme (avoid chasing)
+        rsi_ok_long = rsi_ok_long and rsi_val > 20.0
+        rsi_ok_short = rsi_ok_short and rsi_val < 80.0
+
+        # Minimum ADX requirement — only trade in trending markets
+        adx_ok = adx_val >= max(float(self.cfg.adx_threshold) * 0.8, 12.0)
 
         side = ""
         score = 0.0
@@ -400,10 +463,11 @@ class LuxAlgoStrategy:
                 ctx.get("ob_long") and
                 ctx.get("ema_bull") and
                 ctx.get("candle_ok_l") and
-                25 < rsi_val < 75 and
-                vol_ratio >= 0.7):
+                rsi_ok_long and
+                adx_ok and
+                vol_ratio >= 0.5):
             side = "long"
-            score = float(long_score) * 10.0  # normalize to 0-100ish
+            score = (float(long_score) / max_possible) * 100.0
 
         # SHORT entry
         elif (self.cfg.allow_short and
@@ -412,10 +476,11 @@ class LuxAlgoStrategy:
                 ctx.get("ob_short") and
                 ctx.get("ema_bear") and
                 ctx.get("candle_ok_s") and
-                25 < rsi_val < 75 and
-                vol_ratio >= 0.7):
+                rsi_ok_short and
+                adx_ok and
+                vol_ratio >= 0.5):
             side = "short"
-            score = float(short_score) * 10.0
+            score = (float(short_score) / max_possible) * 100.0
 
         if not side:
             return None
@@ -430,6 +495,8 @@ class LuxAlgoStrategy:
             "htf_trend": ctx.get("htf_trend", 0),
             "ema_fast": ctx.get("ema_fast", 0),
             "ema_slow": ctx.get("ema_slow", 0),
+            "ema_slope": ctx.get("ema_slope", 0.0),
+            "adx": adx_val,
             "lux_strength": score,
             "smc_break": self.last_break_type or "none",
             "long_confluence": long_score,
@@ -437,9 +504,10 @@ class LuxAlgoStrategy:
         }
         note = (
             "SMC " + ("BUY" if side == "long" else "SELL")
-            + " | score " + str(int(score))
+            + " | score " + ("%.0f" % score)
             + " | " + (self.last_break_type or "")
-            + " | RSI " + ("%.1f" % rsi_val)
+            + " | RSI %.1f" % rsi_val
+            + " | ADX %.1f" % adx_val
             + " | ATR%% %.2f" % atr_pct
         )
 

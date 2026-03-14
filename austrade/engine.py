@@ -135,11 +135,32 @@ class TradeEngine:
     def _sync_positions(self) -> None:
         db_positions = self.storage.load_open_positions()
         if db_positions:
-            self.open_positions = db_positions
-            self.position_seq = max(p.id for p in db_positions) + 1
+            max_hours = self.settings.risk.max_position_duration_hours
+            now = datetime.now(timezone.utc)
+            valid_positions: list[Position] = []
             for pos in db_positions:
-                self.trail_distance[pos.id] = abs(pos.entry_price - pos.stop_loss)
-            logger.info("Synced %s positions from DB on startup", len(db_positions))
+                if max_hours > 0:
+                    age_hours = (now - pos.opened_at).total_seconds() / 3600.0
+                    if age_hours >= max_hours:
+                        logger.warning(
+                            "Startup: Eski pozisyon temizlendi (timeout) id=%s symbol=%s age=%.1fh",
+                            pos.id,
+                            pos.symbol,
+                            age_hours,
+                        )
+                        self.storage.delete_position(pos.id)
+                        continue
+                valid_positions.append(pos)
+            self.open_positions = valid_positions
+            if valid_positions:
+                self.position_seq = max(p.id for p in valid_positions) + 1
+                for pos in valid_positions:
+                    self.trail_distance[pos.id] = abs(pos.entry_price - pos.stop_loss)
+            logger.info(
+                "Synced %s positions from DB on startup (%s stale removed)",
+                len(valid_positions),
+                len(db_positions) - len(valid_positions),
+            )
 
         if not self.settings.app.paper_mode and db_positions:
             try:
@@ -297,15 +318,18 @@ class TradeEngine:
         if max_loss_pct <= 0:
             return False
         daily_pnl = self.storage.today_pnl()
-        starting_balance = self.settings.app.starting_balance_usd
+        # Denominator: günlük başlangıç equity'si olarak starting_balance veya
+        # equity'nin en yüksek değerini kullan (daha doğru günlük kayıp hesabı)
+        peak = self.storage.peak_equity()
+        base_equity = max(self.settings.app.starting_balance_usd, self.equity, peak if peak > 0 else 0.0)
         if daily_pnl < 0:
-            loss_pct = abs(daily_pnl) / max(1.0, starting_balance) * 100.0
+            loss_pct = abs(daily_pnl) / max(1.0, base_equity) * 100.0
             if loss_pct >= max_loss_pct:
                 if not self.daily_loss_halted:
                     self.daily_loss_halted = True
                     msg = (
                         f"Gunluk zarar limiti asildi. "
-                        f"PNL: ${daily_pnl:.2f} (-%{loss_pct:.1f}). "
+                        f"PNL: ${daily_pnl:.2f} (-%{loss_pct:.1f} / base=${base_equity:.2f}). "
                         f"Bot yeni pozisyon acmiyor."
                     )
                     logger.warning(msg)
@@ -407,7 +431,8 @@ class TradeEngine:
                 scorecard.summary(),
             )
 
-        sizing = self.risk.size_position(signal, self.equity, df, self.open_positions)
+        consecutive_losses = self._count_consecutive_losses()
+        sizing = self.risk.size_position(signal, self.equity, df, self.open_positions, consecutive_losses)
         if not sizing:
             return
         if self._check_portfolio_notional_cap(symbol, sizing.qty, signal.price):
@@ -497,13 +522,20 @@ class TradeEngine:
         if not pos.trailing_active or pos.trail_callback_pct <= 0:
             return
         callback_ratio = pos.trail_callback_pct / 100.0
+        # Orijinal ATR stop mesafesini de dikkate al (trail_distance sözlüğünden)
+        atr_distance = self.trail_distance.get(pos.id, 0.0)
         if pos.side == "long":
-            new_sl = price * (1.0 - callback_ratio)
+            sl_pct = price * (1.0 - callback_ratio)
+            # ATR tabanlı mesafe varsa ikisinin maksimumunu kullan (daha dar stop)
+            sl_atr = (price - atr_distance) if atr_distance > 0 else sl_pct
+            new_sl = max(sl_pct, sl_atr)
             if new_sl > pos.stop_loss:
                 pos.stop_loss = new_sl
                 self.storage.update_position(pos)
         else:
-            new_sl = price * (1.0 + callback_ratio)
+            sl_pct = price * (1.0 + callback_ratio)
+            sl_atr = (price + atr_distance) if atr_distance > 0 else sl_pct
+            new_sl = min(sl_pct, sl_atr)
             if new_sl < pos.stop_loss:
                 pos.stop_loss = new_sl
                 self.storage.update_position(pos)
@@ -530,7 +562,8 @@ class TradeEngine:
                         pos.qty -= close_qty
                         pos.tp1_hit = True
                         pos.stop_loss = pos.break_even_price
-                        pos.trailing_active = False
+                        # Trailing aktif et: TP1 seviyesinde zaten aktivasyon fiyatı geçildi
+                        pos.trailing_active = True
                         if pos.qty <= 0:
                             self.storage.delete_position(pos.id)
                             self.trail_distance.pop(pos.id, None)

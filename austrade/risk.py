@@ -57,24 +57,71 @@ class RiskManager:
     def _clamp_pct(self, value_pct: float, min_pct: float, max_pct: float) -> float:
         return float(min(max(value_pct, min_pct), max_pct))
 
+    def _score_size_multiplier(self, score: float) -> float:
+        """Return position size multiplier based on signal score (0-100).
+
+        High-conviction signals (score > 80) get up to 1.3x,
+        low-conviction signals (score < 50) get 0.7x.
+        """
+        if score >= 85.0:
+            return 1.30
+        if score >= 70.0:
+            return 1.15
+        if score >= 55.0:
+            return 1.00
+        if score >= 40.0:
+            return 0.85
+        return 0.70
+
+    def _volatility_size_multiplier(self, atr: float, price: float) -> float:
+        """Reduce position size in high-volatility environments.
+
+        ATR% < 0.5 → 1.1x (low vol, tight stops)
+        ATR% 0.5-1.0 → 1.0x (normal)
+        ATR% 1.0-2.0 → 0.85x (elevated)
+        ATR% > 2.0 → 0.70x (high vol, wider stops = bigger risk per qty)
+        """
+        if price <= 0:
+            return 1.0
+        atr_pct = (atr / price) * 100.0
+        if atr_pct < 0.5:
+            return 1.10
+        if atr_pct < 1.0:
+            return 1.00
+        if atr_pct < 2.0:
+            return 0.85
+        return 0.70
+
     def size_position(
         self,
         signal: Signal,
         equity: float,
         df: pd.DataFrame,
         open_positions: list[Position] | None = None,
+        consecutive_losses: int = 0,
     ) -> SizingResult | None:
         atr = self._atr(df)
         if atr <= 0 or signal.price <= 0:
             return None
 
         lev = max(self.cfg.leverage, 1)
-        risk_usd = equity * (self.cfg.risk_per_trade_pct / 100.0)
+        base_risk_pct = self.cfg.risk_per_trade_pct
+
+        # Reduce risk after consecutive losses (progressive de-risking)
+        if consecutive_losses >= 3:
+            base_risk_pct *= 0.50  # 50% reduction after 3+ losses
+        elif consecutive_losses >= 2:
+            base_risk_pct *= 0.70  # 30% reduction after 2 losses
+
+        risk_usd = equity * (base_risk_pct / 100.0)
         stop_distance = atr * self.cfg.atr_stop_mult
         if risk_usd <= 0 or stop_distance <= 0:
             return None
 
-        qty = risk_usd / stop_distance
+        # Dynamic sizing: adjust by signal quality and market volatility
+        score_mult = self._score_size_multiplier(float(signal.score))
+        vol_mult = self._volatility_size_multiplier(atr, signal.price)
+        qty = (risk_usd / stop_distance) * score_mult * vol_mult
 
         used_margin = sum(
             (p.qty * p.entry_price) / lev
@@ -130,7 +177,7 @@ class RiskManager:
         notional = qty * signal.price
         logger.info(
             "Position sized: side=%s price=%.4f qty=%.6f sl=%.4f tp1=%.4f "
-            "lev=%sx notional=%.2f risk_usd=%.2f",
+            "lev=%sx notional=%.2f risk_usd=%.2f score_mult=%.2f vol_mult=%.2f consec_losses=%s",
             signal.side,
             signal.price,
             qty,
@@ -139,6 +186,9 @@ class RiskManager:
             lev,
             notional,
             actual_risk,
+            score_mult,
+            vol_mult,
+            consecutive_losses,
         )
         return SizingResult(
             qty=qty,
